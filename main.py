@@ -22,10 +22,10 @@ def run_backup():
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
 
-        # Dump MongoDB text data to JSON and upload directly to GCS
+        # Dump MongoDB equipment data to JSON and upload directly to GCS
         cmd = (
             f"mongoexport --uri='{mongo_uri}' "
-            f"--collection=textData --jsonArray | gzip | "
+            f"--collection=equipment --jsonArray | gzip | "
             f"gsutil cp - gs://{bucket}/{filename}"
         )
         subprocess.run(cmd, shell=True, check=True)
