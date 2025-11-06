@@ -7,7 +7,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per Cloud Run container
+COUNTER_FILE = "/tmp/backup_counter.txt"  # persists across invocations in Cloud Run
 
 
 @app.route("/", methods=["POST"])
@@ -17,24 +17,24 @@ def run_backup():
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
-    # Folder in bucket (or local dir if Windows)
+    # Folder for this backup (both locally & in GCS)
     folder_name = f"classet-backup-{timestamp}"
     count = get_backup_count()
     backup_files = []
     record_counts = {}
 
-    # Create local folder (so gzip output has a place to go)
+    # Local backup directory (for Windows testing)
     os.makedirs(folder_name, exist_ok=True)
 
     try:
-        print(f"🚀 Starting MongoDB backup #{count} ...")
+        print(f"\n🚀 Starting MongoDB backup #{count} ...\n")
 
         collections = ["users", "equipment"]
 
         for col in collections:
-            print(f"\n📦 Exporting collection '{col}' ...")
+            print(f"📦 Exporting collection '{col}' ...")
 
-            # Count records
+            # Step 1: Count records
             count_cmd = [
                 "mongosh",
                 mongo_uri,
@@ -46,7 +46,8 @@ def run_backup():
             record_counts[col] = count_output or "0"
             print(f"📊 Found {record_counts[col]} documents in '{col}' collection")
 
-            # Print small sample (just for console log)
+            # Step 2: Print small sample (for logs)
+            print(f"🧾 Sample data from '{col}':")
             sample_cmd = [
                 "mongoexport",
                 "--uri", mongo_uri,
@@ -54,28 +55,29 @@ def run_backup():
                 "--jsonArray",
                 "--limit", "2"
             ]
-            print(f"🧾 Sample data from '{col}':")
             subprocess.run(sample_cmd)
 
-            # File path
+            # Step 3: File paths
             local_file = os.path.join(folder_name, f"mongo_backup_{col}.json.gz")
             gcs_path = f"gs://{bucket}/{folder_name}/mongo_backup_{col}.json.gz"
 
+            # Step 4: Export logic based on platform
             if platform.system() == "Windows":
-                # Local backup without gsutil (Windows)
+                # Local backup (Windows)
+                export_json = local_file.replace(".gz", "")
                 export_cmd = [
                     "mongoexport",
                     "--uri", mongo_uri,
                     "--collection", col,
                     "--jsonArray",
-                    "--out", local_file.replace(".gz", "")
+                    "--out", export_json
                 ]
                 subprocess.run(export_cmd, check=True)
-                subprocess.run(["powershell", "Compress-Archive", local_file.replace(".gz", ""), local_file])
+                subprocess.run(["powershell", "Compress-Archive", export_json, local_file])
                 print(f"✅ Local backup created: {local_file}")
                 backup_files.append(local_file)
             else:
-                # Cloud Run backup with gzip + upload
+                # Cloud Run backup (Linux)
                 cmd = (
                     f"mongoexport --uri='{mongo_uri}' "
                     f"--collection={col} --jsonArray | gzip | "
@@ -85,9 +87,11 @@ def run_backup():
                 print(f"☁️ Uploaded: {gcs_path}")
                 backup_files.append(gcs_path)
 
-        send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts, folder=folder_name)
+        # Step 5: Send report
+        send_graph_email(success=True, files=backup_files, count=count,
+                         record_counts=record_counts, folder=folder_name)
         increment_backup_count(count)
-        print(f"🎉 Backup #{count} completed successfully!")
+        print(f"\n🎉 Backup #{count} completed successfully!\n")
         return f"Backup #{count} completed successfully\n", 200
 
     except subprocess.CalledProcessError as e:
@@ -131,7 +135,8 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 
-def send_graph_email(success=True, files=None, error=None, count=1, record_counts=None, folder=None):
+def send_graph_email(success=True, files=None, error=None, count=1,
+                     record_counts=None, folder=None):
     """Send summary email using Microsoft Graph."""
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
@@ -139,19 +144,15 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
 
     if success:
         subject = f"✅ MongoDB Backup Completed #{count}"
-        status_text = f"Backup #{count} completed successfully. Folder: {folder}"
-
-        # Record count table
+        status_text = f"Backup #{count} completed successfully."
         count_rows = "".join(
             f"<tr><td style='padding:5px 10px;border:1px solid #ccc;'>{col}</td>"
             f"<td style='padding:5px 10px;border:1px solid #ccc;'>{record_counts.get(col, '0')}</td></tr>"
             for col in record_counts or []
         )
-
         file_links = "".join(
             f"<li><a href='{f}'>{f}</a></li>" for f in files or []
         )
-
         details = f"""
         <b>Backup Folder:</b> {folder}<br><br>
         <b>Record Counts:</b><br>
@@ -162,7 +163,6 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
         </table>
         <br><b>Files:</b><ul>{file_links}</ul>
         """
-
     else:
         subject = f"❌ MongoDB Backup Failed #{count}"
         status_text = f"MongoDB backup #{count} failed."
@@ -192,10 +192,7 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
     message = {
         "message": {
             "subject": subject,
-            "body": {
-                "contentType": "HTML",
-                "content": html_content,
-            },
+            "body": {"contentType": "HTML", "content": html_content},
             "toRecipients": [{"emailAddress": {"address": addr.strip()}} for addr in recipients],
         }
     }
@@ -211,7 +208,7 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
 
 
 # -----------------------------
-# Debug Route
+# Debug Route (for Cloud Run)
 # -----------------------------
 @app.route("/check-tools", methods=["GET"])
 def check_tools():
