@@ -8,34 +8,31 @@ app = Flask(__name__)
 
 COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per Cloud Run container
 
-
 @app.route("/", methods=["POST"])
 def run_backup():
     """Triggered by Cloud Scheduler every 30 minutes"""
     date = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
+
+    # Read and update counter
     count = get_backup_count()
-    backup_files = []
 
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
 
-        # Collections to back up
-        collections = ["users", "equipment"]
-
-        for col in collections:
-            filename = f"mongo_backup_{col}_{date}.json.gz"
+        # Export both 'users' and 'equipment' collections
+        for collection in ["users", "equipment"]:
+            filename = f"mongo_backup_{collection}_{date}.json.gz"
             cmd = (
                 f"mongoexport --uri='{mongo_uri}' "
-                f"--db=asset --collection={col} --jsonArray | gzip | "
+                f"--collection={collection} --jsonArray | gzip | "
                 f"gsutil cp - gs://{bucket}/{filename}"
             )
             subprocess.run(cmd, shell=True, check=True)
-            backup_files.append(f"gs://{bucket}/{filename}")
-            print(f"✅ {col} collection uploaded to gs://{bucket}/{filename}")
+            print(f"✅ Collection '{collection}' backup uploaded to gs://{bucket}/{filename}")
 
-        send_graph_email(success=True, files=backup_files, count=count)
+        send_graph_email(success=True, filename=date, count=count)
         increment_backup_count(count)
         return f"Backup #{count} completed successfully\n", 200
 
@@ -82,7 +79,7 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 
-def send_graph_email(success=True, files=None, error=None, count=1):
+def send_graph_email(success=True, filename=None, error=None, count=1):
     """Send HTML email using Microsoft Graph API"""
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
@@ -90,16 +87,15 @@ def send_graph_email(success=True, files=None, error=None, count=1):
     bucket = os.environ["BUCKET"]
 
     if success:
-        subject = f"✅ MongoDB Backup Completed #{count}"
+        subject = f"✅ Backup Completed #{count}"
         status_text = f"MongoDB backup #{count} completed successfully."
-        file_links = "<br>".join(files or [])
-        details = f"<b>Files:</b><br>{file_links}"
+        details = f"Files: gs://{bucket}/mongo_backup_users_{filename}.json.gz and mongo_backup_equipment_{filename}.json.gz"
     else:
-        subject = f"❌ MongoDB Backup Failed #{count}"
+        subject = f"❌ Backup Failed #{count}"
         status_text = f"MongoDB backup #{count} failed."
-        details = f"Error:<br>{error}"
+        details = f"Error: {error}"
 
-    # HTML email body
+    # HTML email
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -140,17 +136,6 @@ def send_graph_email(success=True, files=None, error=None, count=1):
         print(f"📧 Email sent for backup #{count}")
     else:
         print(f"⚠️ Email failed for backup #{count}: {r.text}")
-
-
-# -----------------------------
-# Optional Endpoint for Debug
-# -----------------------------
-
-@app.route("/check-tools", methods=["GET"])
-def check_tools():
-    mongo = subprocess.getoutput("mongoexport --version")
-    gsutil = subprocess.getoutput("gsutil version")
-    return f"<pre>{mongo}\n\n{gsutil}</pre>"
 
 
 if __name__ == "__main__":
