@@ -12,29 +12,29 @@ COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per Cloud Run container
 
 @app.route("/", methods=["POST"])
 def run_backup():
-    """
-    Triggered by Cloud Scheduler or manual POST.
-    Exports 'users' and 'equipment' collections from MongoDB,
-    prints data, saves JSON files, optionally uploads to GCS, and sends email.
-    """
-    date = datetime.now().astimezone().strftime("%Y-%m-%dT%H-%M-%SZ")
+    """Triggered by Cloud Scheduler every 30 minutes."""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
+    # Folder in bucket (or local dir if Windows)
+    folder_name = f"classet-backup-{timestamp}"
     count = get_backup_count()
     backup_files = []
     record_counts = {}
 
+    # Create local folder (so gzip output has a place to go)
+    os.makedirs(folder_name, exist_ok=True)
+
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
 
-        # Collections to back up
         collections = ["users", "equipment"]
 
         for col in collections:
             print(f"\n📦 Exporting collection '{col}' ...")
 
-            # Count documents
+            # Count records
             count_cmd = [
                 "mongosh",
                 mongo_uri,
@@ -46,40 +46,46 @@ def run_backup():
             record_counts[col] = count_output or "0"
             print(f"📊 Found {record_counts[col]} documents in '{col}' collection")
 
-            # Print sample data
-            print(f"🧾 Sample data from '{col}':")
+            # Print small sample (just for console log)
             sample_cmd = [
                 "mongoexport",
                 "--uri", mongo_uri,
                 "--collection", col,
                 "--jsonArray",
-                "--limit", "5"
+                "--limit", "2"
             ]
+            print(f"🧾 Sample data from '{col}':")
             subprocess.run(sample_cmd)
 
-            # Export full collection
-            filename = f"mongo_backup_{col}_{date}.json"
-            cmd = (
-                f"mongoexport --uri='{mongo_uri}' "
-                f"--collection={col} --jsonArray | gzip | "
-                f"gsutil cp - gs://{bucket}/{filename}.gz"
-            )
-            subprocess.run(cmd, shell=True, check=True)
-            print(f"🧠 Running: {' '.join(export_cmd)}")
-            subprocess.run(export_cmd, check=True)
-            print(f"✅ Local backup saved: {filename}")
+            # File path
+            local_file = os.path.join(folder_name, f"mongo_backup_{col}.json.gz")
+            gcs_path = f"gs://{bucket}/{folder_name}/mongo_backup_{col}.json.gz"
 
-            # Upload to GCS only if not on Windows
-            if platform.system() != "Windows":
-                upload_cmd = ["gsutil", "cp", filename, f"gs://{bucket}/{filename}"]
-                subprocess.run(upload_cmd, check=True)
-                print(f"☁️ Uploaded to gs://{bucket}/{filename}")
-                backup_files.append(f"gs://{bucket}/{filename}")
+            if platform.system() == "Windows":
+                # Local backup without gsutil (Windows)
+                export_cmd = [
+                    "mongoexport",
+                    "--uri", mongo_uri,
+                    "--collection", col,
+                    "--jsonArray",
+                    "--out", local_file.replace(".gz", "")
+                ]
+                subprocess.run(export_cmd, check=True)
+                subprocess.run(["powershell", "Compress-Archive", local_file.replace(".gz", ""), local_file])
+                print(f"✅ Local backup created: {local_file}")
+                backup_files.append(local_file)
             else:
-                print(f"💾 Skipping GCS upload (Windows local run). File saved locally: {filename}")
-                backup_files.append(filename)
+                # Cloud Run backup with gzip + upload
+                cmd = (
+                    f"mongoexport --uri='{mongo_uri}' "
+                    f"--collection={col} --jsonArray | gzip | "
+                    f"gsutil cp - {gcs_path}"
+                )
+                subprocess.run(cmd, shell=True, check=True)
+                print(f"☁️ Uploaded: {gcs_path}")
+                backup_files.append(gcs_path)
 
-        send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts)
+        send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts, folder=folder_name)
         increment_backup_count(count)
         print(f"🎉 Backup #{count} completed successfully!")
         return f"Backup #{count} completed successfully\n", 200
@@ -95,7 +101,6 @@ def run_backup():
 # Backup Counter Management
 # -----------------------------
 def get_backup_count():
-    """Return current backup count, starting at 1."""
     if os.path.exists(COUNTER_FILE):
         with open(COUNTER_FILE, "r") as f:
             return int(f.read().strip()) + 1
@@ -103,16 +108,14 @@ def get_backup_count():
 
 
 def increment_backup_count(count):
-    """Store the new backup count."""
     with open(COUNTER_FILE, "w") as f:
         f.write(str(count))
 
 
 # -----------------------------
-# Microsoft Graph Email Section
+# Microsoft Graph Email
 # -----------------------------
 def get_graph_token():
-    """Fetch OAuth2 token for Microsoft Graph API."""
     tenant = os.environ["AZURE_TENANT_ID"]
     client = os.environ["AZURE_CLIENT_ID"]
     secret = os.environ["AZURE_CLIENT_SECRET"]
@@ -128,16 +131,17 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 
-def send_graph_email(success=True, files=None, error=None, count=1, record_counts=None):
-    """Send HTML email via Microsoft Graph."""
+def send_graph_email(success=True, files=None, error=None, count=1, record_counts=None, folder=None):
+    """Send summary email using Microsoft Graph."""
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
     recipients = os.environ["EMAIL_TO"].split(",")
 
     if success:
         subject = f"✅ MongoDB Backup Completed #{count}"
-        status_text = f"MongoDB backup #{count} completed successfully."
+        status_text = f"Backup #{count} completed successfully. Folder: {folder}"
 
+        # Record count table
         count_rows = "".join(
             f"<tr><td style='padding:5px 10px;border:1px solid #ccc;'>{col}</td>"
             f"<td style='padding:5px 10px;border:1px solid #ccc;'>{record_counts.get(col, '0')}</td></tr>"
@@ -149,13 +153,14 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
         )
 
         details = f"""
+        <b>Backup Folder:</b> {folder}<br><br>
         <b>Record Counts:</b><br>
         <table style="border-collapse:collapse;margin-top:10px;">
             <tr><th style='border:1px solid #ccc;padding:5px 10px;'>Collection</th>
                 <th style='border:1px solid #ccc;padding:5px 10px;'>Documents</th></tr>
             {count_rows}
         </table>
-        <br><b>Backup Files:</b><ul>{file_links}</ul>
+        <br><b>Files:</b><ul>{file_links}</ul>
         """
 
     else:
@@ -173,7 +178,7 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
             <p style="font-size:16px;color:#1f2937;">{status_text}</p>
             <div style="font-size:15px;color:#4b5563;">{details}</div>
             <p style="margin-top:20px;font-size:14px;color:#6b7280;">
-                Timestamp: {datetime.now().astimezone().isoformat()}
+                Timestamp: {datetime.utcnow().isoformat()}Z
             </p>
             <hr style="margin:25px 0;border-color:#e5e7eb;">
             <p style="text-align:center;font-size:13px;color:#9ca3af;">
@@ -210,14 +215,10 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
 # -----------------------------
 @app.route("/check-tools", methods=["GET"])
 def check_tools():
-    """Check installed tool versions."""
     mongo = subprocess.getoutput("mongoexport --version")
     gsutil = subprocess.getoutput("gsutil version")
     return f"<pre>{mongo}\n\n{gsutil}</pre>"
 
 
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
