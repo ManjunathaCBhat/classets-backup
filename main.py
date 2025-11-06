@@ -1,6 +1,7 @@
 import os
 import subprocess
 import requests
+import platform
 from datetime import datetime
 from flask import Flask
 
@@ -12,10 +13,11 @@ COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per Cloud Run container
 @app.route("/", methods=["POST"])
 def run_backup():
     """
-    Triggered by Cloud Scheduler every 30 minutes.
-    Exports 'users' and 'equipment' collections from MongoDB and uploads them to GCS.
+    Triggered by Cloud Scheduler or manual POST.
+    Exports 'users' and 'equipment' collections from MongoDB,
+    prints data, saves JSON files, optionally uploads to GCS, and sends email.
     """
-    date = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+    date = datetime.now().astimezone().strftime("%Y-%m-%dT%H-%M-%SZ")
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
@@ -30,28 +32,56 @@ def run_backup():
         collections = ["users", "equipment"]
 
         for col in collections:
-            filename = f"mongo_backup_{col}_{date}.json.gz"
+            print(f"\n📦 Exporting collection '{col}' ...")
 
-            # First, count records in this collection
-            count_cmd = (
-                f'mongosh "{mongo_uri}" --quiet --eval "db.asset.{col}.countDocuments()"'
-            )
-            count_output = subprocess.getoutput(count_cmd).strip()
+            # Count documents
+            count_cmd = [
+                "mongosh",
+                mongo_uri,
+                "--quiet",
+                "--eval",
+                f"db.{col}.countDocuments()"
+            ]
+            count_output = subprocess.getoutput(" ".join(count_cmd)).strip()
             record_counts[col] = count_output or "0"
+            print(f"📊 Found {record_counts[col]} documents in '{col}' collection")
 
-            # Then export collection
+            # Print sample data
+            print(f"🧾 Sample data from '{col}':")
+            sample_cmd = [
+                "mongoexport",
+                "--uri", mongo_uri,
+                "--collection", col,
+                "--jsonArray",
+                "--limit", "5"
+            ]
+            subprocess.run(sample_cmd)
+
+            # Export full collection
+            filename = f"mongo_backup_{col}_{date}.json"
             cmd = (
                 f"mongoexport --uri='{mongo_uri}' "
-                f"--db=asset --collection={col} --jsonArray | gzip | "
-                f"gsutil cp - gs://{bucket}/{filename}"
+                f"--collection={col} --jsonArray | gzip | "
+                f"gsutil cp - gs://{bucket}/{filename}.gz"
             )
-            print(f"📦 Exporting collection '{col}' ...")
             subprocess.run(cmd, shell=True, check=True)
-            backup_files.append(f"gs://{bucket}/{filename}")
-            print(f"✅ {col} collection uploaded to gs://{bucket}/{filename}")
+            print(f"🧠 Running: {' '.join(export_cmd)}")
+            subprocess.run(export_cmd, check=True)
+            print(f"✅ Local backup saved: {filename}")
+
+            # Upload to GCS only if not on Windows
+            if platform.system() != "Windows":
+                upload_cmd = ["gsutil", "cp", filename, f"gs://{bucket}/{filename}"]
+                subprocess.run(upload_cmd, check=True)
+                print(f"☁️ Uploaded to gs://{bucket}/{filename}")
+                backup_files.append(f"gs://{bucket}/{filename}")
+            else:
+                print(f"💾 Skipping GCS upload (Windows local run). File saved locally: {filename}")
+                backup_files.append(filename)
 
         send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts)
         increment_backup_count(count)
+        print(f"🎉 Backup #{count} completed successfully!")
         return f"Backup #{count} completed successfully\n", 200
 
     except subprocess.CalledProcessError as e:
@@ -64,7 +94,6 @@ def run_backup():
 # -----------------------------
 # Backup Counter Management
 # -----------------------------
-
 def get_backup_count():
     """Return current backup count, starting at 1."""
     if os.path.exists(COUNTER_FILE):
@@ -82,7 +111,6 @@ def increment_backup_count(count):
 # -----------------------------
 # Microsoft Graph Email Section
 # -----------------------------
-
 def get_graph_token():
     """Fetch OAuth2 token for Microsoft Graph API."""
     tenant = os.environ["AZURE_TENANT_ID"]
@@ -106,22 +134,18 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
     sender = os.environ["EMAIL_FROM"]
     recipients = os.environ["EMAIL_TO"].split(",")
 
-    # Build email body
     if success:
         subject = f"✅ MongoDB Backup Completed #{count}"
         status_text = f"MongoDB backup #{count} completed successfully."
 
-        # Format record counts
         count_rows = "".join(
             f"<tr><td style='padding:5px 10px;border:1px solid #ccc;'>{col}</td>"
             f"<td style='padding:5px 10px;border:1px solid #ccc;'>{record_counts.get(col, '0')}</td></tr>"
             for col in record_counts or []
         )
 
-        # File links
         file_links = "".join(
-            f"<li><a href='https://console.cloud.google.com/storage/browser/{f.replace('gs://', '').replace('/', '/o/')}?project=gcp-practice-for-interns'>{f}</a></li>"
-            for f in files or []
+            f"<li><a href='{f}'>{f}</a></li>" for f in files or []
         )
 
         details = f"""
@@ -139,7 +163,6 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
         status_text = f"MongoDB backup #{count} failed."
         details = f"<b>Error:</b><br><code>{error}</code>"
 
-    # HTML content
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -150,7 +173,7 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
             <p style="font-size:16px;color:#1f2937;">{status_text}</p>
             <div style="font-size:15px;color:#4b5563;">{details}</div>
             <p style="margin-top:20px;font-size:14px;color:#6b7280;">
-                Timestamp: {datetime.utcnow().isoformat()}Z
+                Timestamp: {datetime.now().astimezone().isoformat()}
             </p>
             <hr style="margin:25px 0;border-color:#e5e7eb;">
             <p style="text-align:center;font-size:13px;color:#9ca3af;">
@@ -161,7 +184,6 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
     </html>
     """
 
-    # Send message via Graph API
     message = {
         "message": {
             "subject": subject,
@@ -184,9 +206,8 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
 
 
 # -----------------------------
-# Debug Route (optional)
+# Debug Route
 # -----------------------------
-
 @app.route("/check-tools", methods=["GET"])
 def check_tools():
     """Check installed tool versions."""
@@ -198,6 +219,5 @@ def check_tools():
 # -----------------------------
 # Main
 # -----------------------------
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
