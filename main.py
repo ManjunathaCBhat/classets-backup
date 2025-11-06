@@ -21,6 +21,7 @@ def run_backup():
 
     count = get_backup_count()
     backup_files = []
+    record_counts = {}
 
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
@@ -30,17 +31,26 @@ def run_backup():
 
         for col in collections:
             filename = f"mongo_backup_{col}_{date}.json.gz"
+
+            # First, count records in this collection
+            count_cmd = (
+                f'mongosh "{mongo_uri}" --quiet --eval "db.asset.{col}.countDocuments()"'
+            )
+            count_output = subprocess.getoutput(count_cmd).strip()
+            record_counts[col] = count_output or "0"
+
+            # Then export collection
             cmd = (
                 f"mongoexport --uri='{mongo_uri}' "
                 f"--db=asset --collection={col} --jsonArray | gzip | "
                 f"gsutil cp - gs://{bucket}/{filename}"
             )
-            print(f"📦 Running: {cmd}")
+            print(f"📦 Exporting collection '{col}' ...")
             subprocess.run(cmd, shell=True, check=True)
             backup_files.append(f"gs://{bucket}/{filename}")
-            print(f"✅ {col} collection uploaded successfully")
+            print(f"✅ {col} collection uploaded to gs://{bucket}/{filename}")
 
-        send_graph_email(success=True, files=backup_files, count=count)
+        send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts)
         increment_backup_count(count)
         return f"Backup #{count} completed successfully\n", 200
 
@@ -90,31 +100,52 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 
-def send_graph_email(success=True, files=None, error=None, count=1):
+def send_graph_email(success=True, files=None, error=None, count=1, record_counts=None):
     """Send HTML email via Microsoft Graph."""
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
     recipients = os.environ["EMAIL_TO"].split(",")
 
+    # Build email body
     if success:
         subject = f"✅ MongoDB Backup Completed #{count}"
         status_text = f"MongoDB backup #{count} completed successfully."
+
+        # Format record counts
+        count_rows = "".join(
+            f"<tr><td style='padding:5px 10px;border:1px solid #ccc;'>{col}</td>"
+            f"<td style='padding:5px 10px;border:1px solid #ccc;'>{record_counts.get(col, '0')}</td></tr>"
+            for col in record_counts or []
+        )
+
+        # File links
         file_links = "".join(
             f"<li><a href='https://console.cloud.google.com/storage/browser/{f.replace('gs://', '').replace('/', '/o/')}?project=gcp-practice-for-interns'>{f}</a></li>"
             for f in files or []
         )
-        details = f"<b>Files:</b><ul>{file_links}</ul>"
+
+        details = f"""
+        <b>Record Counts:</b><br>
+        <table style="border-collapse:collapse;margin-top:10px;">
+            <tr><th style='border:1px solid #ccc;padding:5px 10px;'>Collection</th>
+                <th style='border:1px solid #ccc;padding:5px 10px;'>Documents</th></tr>
+            {count_rows}
+        </table>
+        <br><b>Backup Files:</b><ul>{file_links}</ul>
+        """
+
     else:
         subject = f"❌ MongoDB Backup Failed #{count}"
         status_text = f"MongoDB backup #{count} failed."
         details = f"<b>Error:</b><br><code>{error}</code>"
 
+    # HTML content
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head><meta charset="UTF-8"></head>
     <body style="font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;">
-        <div style="max-width:600px;margin:auto;border:1px solid #e5e7eb;border-radius:8px;padding:30px;">
+        <div style="max-width:650px;margin:auto;border:1px solid #e5e7eb;border-radius:8px;padding:25px;">
             <h2 style="color:#4f46e5;">IT Asset Management - Backup Notification</h2>
             <p style="font-size:16px;color:#1f2937;">{status_text}</p>
             <div style="font-size:15px;color:#4b5563;">{details}</div>
@@ -130,6 +161,7 @@ def send_graph_email(success=True, files=None, error=None, count=1):
     </html>
     """
 
+    # Send message via Graph API
     message = {
         "message": {
             "subject": subject,
@@ -143,8 +175,8 @@ def send_graph_email(success=True, files=None, error=None, count=1):
 
     url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
     r = requests.post(url, headers=headers, json=message)
+
     if r.status_code < 300:
         print(f"📧 Email sent for backup #{count}")
     else:
