@@ -6,8 +6,7 @@ from datetime import datetime
 from flask import Flask
 
 app = Flask(__name__)
-
-COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per Cloud Run container
+COUNTER_FILE = "/tmp/backup_counter.txt"  # persists per container
 
 
 @app.route("/", methods=["POST"])
@@ -17,7 +16,6 @@ def run_backup():
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
-    # Create folder in GCS bucket with date
     folder_name = f"classet-backup-{timestamp}"
     count = get_backup_count()
     backup_files = []
@@ -25,7 +23,6 @@ def run_backup():
 
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
-
         collections = ["users", "equipment"]
 
         for col in collections:
@@ -41,22 +38,23 @@ def run_backup():
             ]
             count_output = subprocess.getoutput(" ".join(count_cmd)).strip()
             record_counts[col] = count_output or "0"
-            print(f"📊 Found {record_counts[col]} documents in '{col}' collection")
+            print(f"📊 Found {record_counts[col]} documents in '{col}'")
 
-            # File paths
+            # Create GCS path
             gcs_path = f"gs://{bucket}/{folder_name}/mongo_backup_{col}.json.gz"
 
-            # Export collection and upload to GCS folder
+            # Export + compress + upload
             cmd = (
                 f"mongoexport --uri='{mongo_uri}' "
-                f"--collection={col} --jsonArray | gzip | "
-                f"gsutil cp - {gcs_path}"
+                f"--collection={col} --jsonArray | gzip | gsutil cp - {gcs_path}"
             )
+            print(f"🧠 Running: {cmd}")
             subprocess.run(cmd, shell=True, check=True)
             print(f"☁️ Uploaded: {gcs_path}")
             backup_files.append(gcs_path)
 
-        send_graph_email(success=True, files=backup_files, count=count, record_counts=record_counts, folder=folder_name)
+        send_graph_email(success=True, files=backup_files, count=count,
+                         record_counts=record_counts, folder=folder_name)
         increment_backup_count(count)
         print(f"🎉 Backup #{count} completed successfully!")
         return f"Backup #{count} completed successfully\n", 200
@@ -68,9 +66,7 @@ def run_backup():
         return f"Backup #{count} failed\n", 500
 
 
-# -----------------------------
-# Counter Management
-# -----------------------------
+# ----------------------------- Helper functions -----------------------------
 def get_backup_count():
     if os.path.exists(COUNTER_FILE):
         with open(COUNTER_FILE, "r") as f:
@@ -83,9 +79,7 @@ def increment_backup_count(count):
         f.write(str(count))
 
 
-# -----------------------------
-# Microsoft Graph Email
-# -----------------------------
+# ----------------------------- Microsoft Graph Email -----------------------------
 def get_graph_token():
     tenant = os.environ["AZURE_TENANT_ID"]
     client = os.environ["AZURE_CLIENT_ID"]
@@ -102,7 +96,8 @@ def get_graph_token():
     return resp.json()["access_token"]
 
 
-def send_graph_email(success=True, files=None, error=None, count=1, record_counts=None, folder=None):
+def send_graph_email(success=True, files=None, error=None,
+                     count=1, record_counts=None, folder=None):
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
     recipients = os.environ["EMAIL_TO"].split(",")
@@ -128,7 +123,6 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
         </table>
         <br><b>Files:</b><ul>{file_links}</ul>
         """
-
     else:
         subject = f"❌ MongoDB Backup Failed #{count}"
         status_text = f"MongoDB backup #{count} failed."
@@ -136,7 +130,9 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
 
     html_content = f"""
     <!DOCTYPE html>
-    <html><body style="font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;">
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;">
         <div style="max-width:650px;margin:auto;border:1px solid #e5e7eb;border-radius:8px;padding:25px;">
             <h2 style="color:#4f46e5;">IT Asset Management - Backup Notification</h2>
             <p style="font-size:16px;color:#1f2937;">{status_text}</p>
@@ -145,24 +141,30 @@ def send_graph_email(success=True, files=None, error=None, count=1, record_count
                 Timestamp: {datetime.utcnow().isoformat()}Z
             </p>
         </div>
-    </body></html>
+    </body>
+    </html>
     """
 
     message = {
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_content},
-            "toRecipients": [{"emailAddress": {"address": addr.strip()}} for addr in recipients],
+            "toRecipients": [{"emailAddress": {"address": addr.strip()}}
+                             for addr in recipients],
         }
     }
 
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    requests.post(f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail", headers=headers, json=message)
+    url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+    headers = {"Authorization": f"Bearer {access_token}",
+               "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json=message)
+    if r.status_code < 300:
+        print(f"📧 Email sent for backup #{count}")
+    else:
+        print(f"⚠️ Email failed for backup #{count}: {r.text}")
 
 
-# -----------------------------
-# Debug Endpoint
-# -----------------------------
+# ----------------------------- Debug route -----------------------------
 @app.route("/check-tools", methods=["GET"])
 def check_tools():
     mongo = subprocess.getoutput("mongoexport --version")
