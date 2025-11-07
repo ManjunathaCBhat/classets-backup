@@ -4,37 +4,37 @@ import requests
 import platform
 from datetime import datetime
 from flask import Flask
+import schedule
+import time
+import threading
 
 app = Flask(__name__)
 
-COUNTER_FILE = "/tmp/backup_counter.txt"  # persists across invocations in Cloud Run
+COUNTER_FILE = "/tmp/backup_counter.txt"  # persists on Cloud Run
+BACKUP_TIME = "02:00"  # Time of day to run backup (24hr format)
 
 
-@app.route("/", methods=["POST"])
-def run_backup():
-    """Triggered by Cloud Scheduler every 30 minutes."""
+def perform_backup():
+    """Main backup logic, used by both API trigger and scheduler."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
-    # Folder for this backup (both locally & in GCS)
     folder_name = f"classet-backup-{timestamp}"
     count = get_backup_count()
     backup_files = []
     record_counts = {}
 
-    # Local backup directory (for Windows testing)
     os.makedirs(folder_name, exist_ok=True)
+    print(f"\n🚀 Starting MongoDB backup #{count} at {timestamp}...\n")
 
     try:
-        print(f"\n🚀 Starting MongoDB backup #{count} ...\n")
-
         collections = ["users", "equipment"]
 
         for col in collections:
             print(f"📦 Exporting collection '{col}' ...")
 
-            # Step 1: Count records
+            # Count records
             count_cmd = [
                 "mongosh",
                 mongo_uri,
@@ -44,10 +44,10 @@ def run_backup():
             ]
             count_output = subprocess.getoutput(" ".join(count_cmd)).strip()
             record_counts[col] = count_output or "0"
-            print(f"📊 Found {record_counts[col]} documents in '{col}' collection")
+            print(f"📊 Found {record_counts[col]} records in '{col}'")
 
-            # Step 2: Print small sample (for logs)
-            print(f"🧾 Sample data from '{col}':")
+            # Print sample data
+            print(f"🧾 Sample from '{col}':")
             sample_cmd = [
                 "mongoexport",
                 "--uri", mongo_uri,
@@ -57,13 +57,12 @@ def run_backup():
             ]
             subprocess.run(sample_cmd)
 
-            # Step 3: File paths
+            # Backup file paths
             local_file = os.path.join(folder_name, f"mongo_backup_{col}.json.gz")
             gcs_path = f"gs://{bucket}/{folder_name}/mongo_backup_{col}.json.gz"
 
-            # Step 4: Export logic based on platform
+            # Export command
             if platform.system() == "Windows":
-                # Local backup (Windows)
                 export_json = local_file.replace(".gz", "")
                 export_cmd = [
                     "mongoexport",
@@ -77,7 +76,7 @@ def run_backup():
                 print(f"✅ Local backup created: {local_file}")
                 backup_files.append(local_file)
             else:
-                # Cloud Run backup (Linux)
+                # Cloud Run (Linux)
                 cmd = (
                     f"mongoexport --uri='{mongo_uri}' "
                     f"--collection={col} --jsonArray | gzip | "
@@ -87,23 +86,23 @@ def run_backup():
                 print(f"☁️ Uploaded: {gcs_path}")
                 backup_files.append(gcs_path)
 
-        # Step 5: Send report
         send_graph_email(success=True, files=backup_files, count=count,
                          record_counts=record_counts, folder=folder_name)
         increment_backup_count(count)
         print(f"\n🎉 Backup #{count} completed successfully!\n")
-        return f"Backup #{count} completed successfully\n", 200
 
     except subprocess.CalledProcessError as e:
-        error_msg = str(e)
-        print(f"❌ Backup failed: {error_msg}")
-        send_graph_email(success=False, error=error_msg, count=count)
-        return f"Backup #{count} failed\n", 500
+        print(f"❌ Backup failed: {e}")
+        send_graph_email(success=False, error=str(e), count=count)
 
 
-# -----------------------------
-# Backup Counter Management
-# -----------------------------
+@app.route("/", methods=["POST"])
+def manual_trigger():
+    """Manual trigger endpoint for Cloud Run."""
+    threading.Thread(target=perform_backup).start()
+    return "Backup started in background!\n", 200
+
+
 def get_backup_count():
     if os.path.exists(COUNTER_FILE):
         with open(COUNTER_FILE, "r") as f:
@@ -117,7 +116,7 @@ def increment_backup_count(count):
 
 
 # -----------------------------
-# Microsoft Graph Email
+# Email via Microsoft Graph
 # -----------------------------
 def get_graph_token():
     tenant = os.environ["AZURE_TENANT_ID"]
@@ -137,7 +136,6 @@ def get_graph_token():
 
 def send_graph_email(success=True, files=None, error=None, count=1,
                      record_counts=None, folder=None):
-    """Send summary email using Microsoft Graph."""
     access_token = get_graph_token()
     sender = os.environ["EMAIL_FROM"]
     recipients = os.environ["EMAIL_TO"].split(",")
@@ -150,43 +148,26 @@ def send_graph_email(success=True, files=None, error=None, count=1,
             f"<td style='padding:5px 10px;border:1px solid #ccc;'>{record_counts.get(col, '0')}</td></tr>"
             for col in record_counts or []
         )
-        file_links = "".join(
-            f"<li><a href='{f}'>{f}</a></li>" for f in files or []
-        )
+        file_links = "".join(f"<li><a href='{f}'>{f}</a></li>" for f in files or [])
         details = f"""
         <b>Backup Folder:</b> {folder}<br><br>
-        <b>Record Counts:</b><br>
-        <table style="border-collapse:collapse;margin-top:10px;">
-            <tr><th style='border:1px solid #ccc;padding:5px 10px;'>Collection</th>
-                <th style='border:1px solid #ccc;padding:5px 10px;'>Documents</th></tr>
-            {count_rows}
-        </table>
-        <br><b>Files:</b><ul>{file_links}</ul>
+        <b>Record Counts:</b>
+        <table style="border-collapse:collapse;">
+            <tr><th>Collection</th><th>Documents</th></tr>{count_rows}
+        </table><br>
+        <b>Files:</b><ul>{file_links}</ul>
         """
     else:
         subject = f"❌ MongoDB Backup Failed #{count}"
-        status_text = f"MongoDB backup #{count} failed."
-        details = f"<b>Error:</b><br><code>{error}</code>"
+        status_text = f"Backup #{count} failed."
+        details = f"<b>Error:</b><pre>{error}</pre>"
 
     html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;">
-        <div style="max-width:650px;margin:auto;border:1px solid #e5e7eb;border-radius:8px;padding:25px;">
-            <h2 style="color:#4f46e5;">IT Asset Management - Backup Notification</h2>
-            <p style="font-size:16px;color:#1f2937;">{status_text}</p>
-            <div style="font-size:15px;color:#4b5563;">{details}</div>
-            <p style="margin-top:20px;font-size:14px;color:#6b7280;">
-                Timestamp: {datetime.utcnow().isoformat()}Z
-            </p>
-            <hr style="margin:25px 0;border-color:#e5e7eb;">
-            <p style="text-align:center;font-size:13px;color:#9ca3af;">
-                This is an automated message. Please do not reply.
-            </p>
-        </div>
-    </body>
-    </html>
+    <html><body>
+    <h2>IT Asset Management - Backup Notification</h2>
+    <p>{status_text}</p>{details}
+    <p><small>Timestamp: {datetime.utcnow().isoformat()}Z</small></p>
+    </body></html>
     """
 
     message = {
@@ -204,11 +185,11 @@ def send_graph_email(success=True, files=None, error=None, count=1,
     if r.status_code < 300:
         print(f"📧 Email sent for backup #{count}")
     else:
-        print(f"⚠️ Email failed for backup #{count}: {r.text}")
+        print(f"⚠️ Email failed: {r.text}")
 
 
 # -----------------------------
-# Debug Route (for Cloud Run)
+# Utility: Check tools
 # -----------------------------
 @app.route("/check-tools", methods=["GET"])
 def check_tools():
@@ -217,5 +198,27 @@ def check_tools():
     return f"<pre>{mongo}\n\n{gsutil}</pre>"
 
 
+# -----------------------------
+# Scheduler for local testing
+# -----------------------------
+def run_scheduler():
+    """Runs the daily backup at set time (for local testing)."""
+    schedule.every().day.at(BACKUP_TIME).do(perform_backup)
+    print(f"🕒 Daily backup scheduled for {BACKUP_TIME} UTC")
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    import threading
+
+    if platform.system() == "Windows":
+        # Local dev: run scheduler + Flask
+        threading.Thread(target=run_scheduler, daemon=True).start()
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    else:
+        # Cloud Run: only triggered by Cloud Scheduler
+        print("🌩️ Running in Cloud Run mode — waiting for Cloud Scheduler trigger...")
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
