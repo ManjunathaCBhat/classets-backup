@@ -6,6 +6,7 @@ import gzip
 from datetime import datetime
 from pathlib import Path
 from flask import Flask
+from google.cloud import storage
 
 app = Flask(__name__)
 COUNTER_FILE = "/tmp/backup_counter.txt"
@@ -13,6 +14,9 @@ TEMP_DIR = "/tmp/mongo_backups"
 
 # Ensure temp directory exists
 Path(TEMP_DIR).mkdir(exist_ok=True)
+
+# Initialize GCS client
+gcs_client = storage.Client()
 
 
 @app.route("/", methods=["POST"])
@@ -161,21 +165,16 @@ def compress_file(input_file, output_file):
 
 
 def upload_to_gcs(local_file, gcs_path):
-    """Upload file to Google Cloud Storage."""
+    """Upload file to Google Cloud Storage using Python client."""
     try:
-        cmd = [
-            "gsutil",
-            "cp",
-            local_file,
-            gcs_path
-        ]
+        # Parse GCS path: gs://bucket/path/to/file
+        gcs_path_clean = gcs_path.replace("gs://", "")
+        bucket_name, blob_path = gcs_path_clean.split("/", 1)
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        bucket = gcs_client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
         
-        if result.returncode != 0:
-            print(f"❌ gsutil error: {result.stderr}")
-            return False
-        
+        blob.upload_from_filename(local_file)
         print(f"✅ Upload succeeded: {gcs_path}")
         return True
     
