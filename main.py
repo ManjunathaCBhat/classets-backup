@@ -104,26 +104,37 @@ def increment_backup_count(count):
 
 
 def count_collection(mongo_uri, collection):
-    """Count documents in a collection using mongostat or mongosh."""
+    """Count documents in a collection using PyMongo."""
     try:
-        cmd = [
-            "mongosh",
-            mongo_uri,
-            "--quiet",
-            "--eval",
-            f"db.{collection}.countDocuments()"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            print(f"⚠️ Error counting {collection}: {result.stderr}")
-            return "0"
-        
-        count = result.stdout.strip()
-        return count if count else "0"
+        from pymongo import MongoClient
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        db = client.get_default_database()
+        count = db[collection].count_documents({})
+        client.close()
+        print(f"✅ PyMongo count for {collection}: {count}")
+        return str(count)
     except Exception as e:
         print(f"⚠️ Exception counting {collection}: {e}")
-        return "0"
+        # Fallback to mongosh
+        try:
+            cmd = [
+                "mongosh",
+                mongo_uri,
+                "--quiet",
+                "--eval",
+                f"db.{collection}.countDocuments()"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                print(f"⚠️ mongosh error: {result.stderr}")
+                return "0"
+            
+            count = result.stdout.strip()
+            return count if count else "0"
+        except Exception as e2:
+            print(f"⚠️ mongosh also failed: {e2}")
+            return "0"
 
 
 def export_collection(mongo_uri, collection, output_file):
@@ -137,17 +148,46 @@ def export_collection(mongo_uri, collection, output_file):
             f"--out={output_file}"
         ]
         
+        print(f"🔧 Running: mongoexport --uri=*** --collection={collection} --jsonArray --out={output_file}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        print(f"Return code: {result.returncode}")
+        if result.stdout:
+            print(f"STDOUT: {result.stdout}")
+        if result.stderr:
+            print(f"STDERR: {result.stderr}")
         
         if result.returncode != 0:
             print(f"❌ mongoexport error: {result.stderr}")
             return False
+        
+        # Check if file was created and has content
+        if not os.path.exists(output_file):
+            print(f"❌ Output file not created: {output_file}")
+            return False
+        
+        file_size = os.path.getsize(output_file)
+        print(f"📊 File created: {output_file}, Size: {file_size} bytes")
+        
+        if file_size == 0:
+            print(f"⚠️ Warning: File is empty for collection '{collection}'")
+            # Still return True to continue, but log the warning
+        
+        # Show first 200 chars of file content
+        try:
+            with open(output_file, 'r') as f:
+                preview = f.read(200)
+                print(f"📄 File preview: {preview}")
+        except:
+            pass
         
         print(f"✅ mongoexport succeeded for {collection}")
         return True
     
     except Exception as e:
         print(f"❌ Exception during export: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -281,10 +321,60 @@ def check_tools():
     return f"<pre>{mongo}\n\n{gsutil}</pre>"
 
 
-@app.route("/test-backup", methods=["GET"])
+@app.route("/test-backup", methods=["GET", "POST"])
 def test_backup():
     """Manual test endpoint for debugging."""
     return run_backup()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "temp_dir": TEMP_DIR,
+        "counter_file": COUNTER_FILE
+    }, 200
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Debug endpoint to check environment and tools."""
+    try:
+        mongo_uri = os.environ.get("MONGO_URI", "NOT SET")
+        bucket = os.environ.get("BUCKET", "NOT SET")
+        
+        # Mask sensitive data
+        mongo_uri_masked = mongo_uri[:50] + "***" if mongo_uri != "NOT SET" else "NOT SET"
+        
+        # Check tools
+        mongoexport_version = subprocess.getoutput("mongoexport --version")
+        mongosh_version = subprocess.getoutput("mongosh --version")
+        
+        # Check GCS access
+        try:
+            buckets = list(gcs_client.list_buckets(max_results=5))
+            bucket_names = [b.name for b in buckets]
+        except Exception as e:
+            bucket_names = f"Error: {str(e)}"
+        
+        # Check temp directory
+        temp_files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else "DIR NOT EXISTS"
+        
+        return {
+            "status": "debug info",
+            "mongo_uri": mongo_uri_masked,
+            "bucket": bucket,
+            "mongoexport_version": mongoexport_version,
+            "mongosh_version": mongosh_version,
+            "gcs_buckets": bucket_names,
+            "temp_dir_contents": temp_files,
+            "backup_counter": get_backup_count(),
+            "timestamp": datetime.utcnow().isoformat()
+        }, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 
 if __name__ == "__main__":
