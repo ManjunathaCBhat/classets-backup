@@ -33,7 +33,7 @@ def run_backup():
 
     try:
         print(f"🚀 Starting MongoDB backup #{count} ...")
-        collections = ["users", "equipment"]
+        collections = ["users", "equipment", "equipment_history", "equipment_status_periods"]
 
         for col in collections:
             print(f"\n📦 Exporting collection '{col}' ...")
@@ -48,14 +48,17 @@ def run_backup():
             export_success = export_collection(mongo_uri, col, local_json_file)
             
             if not export_success:
-                raise Exception(f"Failed to export collection '{col}'")
+                print(f"⚠️ Warning: Export failed for '{col}', skipping...")
+                continue
 
             # Verify file has content
             file_size = os.path.getsize(local_json_file)
             print(f"📄 Exported file size: {file_size} bytes")
             
             if file_size == 0:
-                raise Exception(f"Exported file for '{col}' is empty!")
+                print(f"⚠️ Warning: Exported file for '{col}' is empty, skipping...")
+                os.remove(local_json_file)
+                continue
 
             # Step 3: Compress
             compressed_file = f"{local_json_file}.gz"
@@ -67,25 +70,33 @@ def run_backup():
             upload_success = upload_to_gcs(compressed_file, gcs_path)
             
             if not upload_success:
-                raise Exception(f"Failed to upload {gcs_path}")
-
-            print(f"☁️ Uploaded: {gcs_path}")
-            backup_files.append(gcs_path)
+                print(f"⚠️ Warning: Failed to upload {gcs_path}, skipping...")
+            else:
+                print(f"☁️ Uploaded: {gcs_path}")
+                backup_files.append(gcs_path)
 
             # Cleanup local files
-            os.remove(local_json_file)
-            os.remove(compressed_file)
+            if os.path.exists(local_json_file):
+                os.remove(local_json_file)
+            if os.path.exists(compressed_file):
+                os.remove(compressed_file)
 
-        send_graph_email(success=True, files=backup_files, count=count,
-                         record_counts=record_counts, folder=folder_name)
-        increment_backup_count(count)
-        print(f"🎉 Backup #{count} completed successfully!")
-        return f"Backup #{count} completed successfully\n", 200
+        if backup_files:
+            send_graph_email(success=True, files=backup_files, count=count,
+                             record_counts=record_counts, folder=folder_name)
+            increment_backup_count(count)
+            print(f"🎉 Backup #{count} completed successfully!")
+            return f"Backup #{count} completed successfully\n", 200
+        else:
+            raise Exception("No files were successfully backed up")
 
     except Exception as e:
         error_msg = str(e)
         print(f"❌ Backup failed: {error_msg}")
-        send_graph_email(success=False, error=error_msg, count=count)
+        try:
+            send_graph_email(success=False, error=error_msg, count=count)
+        except:
+            print("⚠️ Failed to send error email")
         return f"Backup #{count} failed: {error_msg}\n", 500
 
 
@@ -115,26 +126,7 @@ def count_collection(mongo_uri, collection):
         return str(count)
     except Exception as e:
         print(f"⚠️ Exception counting {collection}: {e}")
-        # Fallback to mongosh
-        try:
-            cmd = [
-                "mongosh",
-                mongo_uri,
-                "--quiet",
-                "--eval",
-                f"db.{collection}.countDocuments()"
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                print(f"⚠️ mongosh error: {result.stderr}")
-                return "0"
-            
-            count = result.stdout.strip()
-            return count if count else "0"
-        except Exception as e2:
-            print(f"⚠️ mongosh also failed: {e2}")
-            return "0"
+        return "0"
 
 
 def export_collection(mongo_uri, collection, output_file):
@@ -171,7 +163,7 @@ def export_collection(mongo_uri, collection, output_file):
         
         if file_size == 0:
             print(f"⚠️ Warning: File is empty for collection '{collection}'")
-            # Still return True to continue, but log the warning
+            return False
         
         # Show first 200 chars of file content
         try:
@@ -226,9 +218,13 @@ def upload_to_gcs(local_file, gcs_path):
 # ----------------------------- Microsoft Graph Email -----------------------------
 
 def get_graph_token():
-    tenant = os.environ["AZURE_TENANT_ID"]
-    client = os.environ["AZURE_CLIENT_ID"]
-    secret = os.environ["AZURE_CLIENT_SECRET"]
+    tenant = os.environ.get("AZURE_TENANT_ID")
+    client = os.environ.get("AZURE_CLIENT_ID")
+    secret = os.environ.get("AZURE_CLIENT_SECRET")
+    
+    if not all([tenant, client, secret]) or any(x in ["none", "skip", "your_"] for x in [tenant, client, secret]):
+        raise Exception("Azure credentials not configured")
+    
     token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
     data = {
         "grant_type": "client_credentials",
@@ -245,8 +241,12 @@ def send_graph_email(success=True, files=None, error=None,
                      count=1, record_counts=None, folder=None):
     try:
         access_token = get_graph_token()
-        sender = os.environ["EMAIL_FROM"]
-        recipients = os.environ["EMAIL_TO"].split(",")
+        sender = os.environ.get("EMAIL_FROM")
+        recipients = os.environ.get("EMAIL_TO", "").split(",")
+        
+        if not sender or not recipients or any(x in ["none", "skip"] for x in [sender] + recipients):
+            print("⚠️ Email credentials not configured, skipping email")
+            return
 
         if success:
             subject = f"✅ MongoDB Backup Completed #{count}"
@@ -296,7 +296,7 @@ def send_graph_email(success=True, files=None, error=None,
                 "subject": subject,
                 "body": {"contentType": "HTML", "content": html_content},
                 "toRecipients": [{"emailAddress": {"address": addr.strip()}}
-                                 for addr in recipients],
+                                 for addr in recipients if addr.strip()],
             }
         }
 
@@ -313,19 +313,6 @@ def send_graph_email(success=True, files=None, error=None,
 
 
 # ----------------------------- Debug route -----------------------------
-
-@app.route("/check-tools", methods=["GET"])
-def check_tools():
-    mongo = subprocess.getoutput("mongoexport --version")
-    gsutil = subprocess.getoutput("gsutil version")
-    return f"<pre>{mongo}\n\n{gsutil}</pre>"
-
-
-@app.route("/test-backup", methods=["GET", "POST"])
-def test_backup():
-    """Manual test endpoint for debugging."""
-    return run_backup()
-
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -350,7 +337,6 @@ def debug():
         
         # Check tools
         mongoexport_version = subprocess.getoutput("mongoexport --version")
-        mongosh_version = subprocess.getoutput("mongosh --version")
         
         # Check GCS access
         try:
@@ -367,7 +353,6 @@ def debug():
             "mongo_uri": mongo_uri_masked,
             "bucket": bucket,
             "mongoexport_version": mongoexport_version,
-            "mongosh_version": mongosh_version,
             "gcs_buckets": bucket_names,
             "temp_dir_contents": temp_files,
             "backup_counter": get_backup_count(),
