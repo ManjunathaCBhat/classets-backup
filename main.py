@@ -26,7 +26,6 @@ def run_backup():
     mongo_uri = os.environ["MONGO_URI"]
     bucket = os.environ["BUCKET"]
 
-    folder_name = f"classet-backup-{timestamp}"
     count = get_backup_count()
     backup_files = []
     record_counts = {}
@@ -66,7 +65,7 @@ def run_backup():
             print(f"🗜️ Compressed to: {compressed_file}")
 
             # Step 4: Upload to GCS
-            gcs_path = f"gs://{bucket}/{folder_name}/mongo_backup_{col}.json.gz"
+            gcs_path = f"gs://{bucket}/mongo_backup_{col}_{timestamp}.json.gz"
             upload_success = upload_to_gcs(compressed_file, gcs_path)
             
             if not upload_success:
@@ -82,8 +81,12 @@ def run_backup():
                 os.remove(compressed_file)
 
         if backup_files:
-            send_graph_email(success=True, files=backup_files, count=count,
-                             record_counts=record_counts, folder=folder_name)
+            try:
+                send_graph_email(success=True, files=backup_files, count=count,
+                                 record_counts=record_counts, folder=timestamp)
+            except Exception as e:
+                print(f"⚠️ Email error (backup still succeeded): {e}")
+            
             increment_backup_count(count)
             print(f"🎉 Backup #{count} completed successfully!")
             return f"Backup #{count} completed successfully\n", 200
@@ -312,7 +315,7 @@ def send_graph_email(success=True, files=None, error=None,
         print(f"⚠️ Email notification failed: {e}")
 
 
-# ----------------------------- Debug route -----------------------------
+# ----------------------------- Debug routes -----------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
