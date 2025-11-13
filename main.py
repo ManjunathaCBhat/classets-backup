@@ -7,7 +7,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from google.cloud import storage
-import functions_framework
+from flask import Flask, request
+
+# Setup Flask app
+app = Flask(__name__)
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -22,10 +25,10 @@ Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 gcs_client = storage.Client()
 
 
-@functions_framework.http
-def mongodb_backup(request):
+@app.route("/", methods=["POST"])
+def mongodb_backup():
     """
-    HTTP Cloud Function triggered by Cloud Scheduler.
+    HTTP endpoint triggered by Cloud Scheduler.
     Performs MongoDB backup and sends email notification.
     """
     try:
@@ -133,6 +136,36 @@ def mongodb_backup(request):
             logger.error(f"Failed to send error email: {email_error}")
         
         return {"status": "failed", "error": error_msg}, 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "mongodb-backup"
+    }, 200
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Debug endpoint."""
+    try:
+        mongo_uri = os.environ.get("MONGO_URI", "NOT SET")
+        bucket = os.environ.get("BUCKET", "NOT SET")
+        mongo_uri_masked = mongo_uri[:50] + "***" if mongo_uri != "NOT SET" else "NOT SET"
+        
+        return {
+            "status": "debug",
+            "mongo_uri": mongo_uri_masked,
+            "bucket": bucket,
+            "backup_counter": get_backup_count(),
+            "temp_dir": TEMP_DIR,
+            "timestamp": datetime.utcnow().isoformat()
+        }, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 
 # ======================== Helper Functions ========================
@@ -353,3 +386,8 @@ def send_email_notification(success=True, files=None, error=None,
     
     except Exception as e:
         logger.error(f"Email notification failed: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
