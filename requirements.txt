@@ -1,10 +1,5 @@
-functions-framework==3.5.0
+Flask==2.3.0
 google-cloud-storage==2.10.0
 pymongo==4.6.0
 requests==2.31.0
-python-dotenv==1.0.0
-Flask==3.0.0
-requests==2.31.0
-pymongo==4.6.0
-google-cloud-storage==2.10.0
-Werkzeug==3.0.0
+gunicorn==21.2.0
