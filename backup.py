@@ -170,7 +170,6 @@ class MongoDBBackup:
             <tr>
                 <td style="font-size:15px;color:#6b7280;font-weight:600;padding:12px 0;width:140px;">{item['collection']}</td>
                 <td style="font-size:15px;color:#111827;font-weight:500;padding:12px 0;text-align:right;">{item['documents']}</td>
-                <td style="font-size:15px;color:#111827;font-weight:500;padding:12px 0;font-size:13px;">{item['file']}</td>
             </tr>
             """
             
@@ -219,7 +218,6 @@ class MongoDBBackup:
                                                         <tr style="background-color:#f3f4f6;">
                                                             <td style="font-size:15px;color:#111827;font-weight:700;padding:12px 0;width:140px;">Collection</td>
                                                             <td style="font-size:15px;color:#111827;font-weight:700;padding:12px 0;text-align:right;">Documents</td>
-                                                            <td style="font-size:15px;color:#111827;font-weight:700;padding:12px 0;">File Location</td>
                                                         </tr>
                                                         {collection_rows}
                                                     </table>
