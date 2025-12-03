@@ -1,40 +1,36 @@
-#!/usr/bin/env python3
-"""
-Minimal Cloud Run entry point - WORKS with your existing backup.py
-"""
-
 import os
-from flask import Flask
+import sys
+import logging
+
+# Add the current directory to the Python path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from flask import Flask, jsonify
 from backup import MongoDBBackup
 import logging
-import threading
 
-app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+@@ -22,7 +22,7 @@
+def trigger_backup():
+    """Trigger MongoDB backup via HTTP POST"""
+    try:
+        logger.info("Backup triggered")
+        logger.info("🚀 Backup triggered")
 
-@app.route('/', methods=['GET', 'POST'])
-def health():
-    return "MongoDB Backup Service - Healthy", 200
+        backup = MongoDBBackup()
+        success = backup.run_backup()
+@@ -37,12 +37,12 @@
+            'backup_info': backup.backup_info
+        }), 200 if success else 500
+    except Exception as e:
+        logger.error(f'Error during backup: {str(e)}', exc_info=True)
+        logger.error(f'❌ Error during backup: {str(e)}', exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
-@app.route('/backup', methods=['POST'])
-def backup():
-    """Trigger backup"""
-    def run_backup():
-        try:
-            backup = MongoDBBackup()
-            backup.run_backup()
-            logger.info("✅ Backup completed")
-        except Exception as e:
-            logger.error(f"❌ Backup failed: {e}")
-    
-    # Run backup in background thread
-    thread = threading.Thread(target=run_backup)
-    thread.daemon = True
-    thread.start()
-    
-    return "Backup started", 202
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
